@@ -17,6 +17,7 @@ import (
 	"go.k6.io/k6/internal/lib/netext/grpcext"
 	"go.k6.io/k6/internal/lib/testutils/httpmultibin"
 	grpcanytesting "go.k6.io/k6/internal/lib/testutils/httpmultibin/grpc_any_testing"
+	grpcnestedenum "go.k6.io/k6/internal/lib/testutils/httpmultibin/grpc_nested_enum_testing"
 	"go.k6.io/k6/internal/lib/testutils/httpmultibin/grpc_testing"
 	"go.k6.io/k6/internal/lib/testutils/httpmultibin/grpc_wrappers_testing"
 	"go.k6.io/k6/lib/fsext"
@@ -35,7 +36,9 @@ import (
 	"github.com/golang/protobuf/ptypes/any"
 	_struct "github.com/golang/protobuf/ptypes/struct"
 	"github.com/golang/protobuf/ptypes/wrappers"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/sirupsen/logrus"
@@ -832,6 +835,164 @@ func TestClient(t *testing.T) {
 					client.connect("GRPCBIN_ADDR", {reflect: true})
 					client.invoke("grpc.testing.TestService/EmptyCall", {})
 				`,
+			},
+		},
+		{
+			// Regression test: two messages in the same package both define a
+			// nested enum with the same local name (SortOrder). k6's reflection
+			// client used to fail with:
+			//   GoError: can't convert method info: proto: file
+			//   "grpc.nested_enum_testing.ListFoosRequest.SortOrder.proto" has
+			//   a name conflict over
+			//   grpc.nested_enum_testing.SORT_ORDER_UNSPECIFIED
+			name: "ReflectNestedEnumNameConflict",
+			setup: func(tb *httpmultibin.HTTPMultiBin) {
+				grpcnestedenum.RegisterNestedEnumServiceServer(tb.ServerGRPC, &grpcnestedenum.Server{})
+				reflection.Register(tb.ServerGRPC)
+			},
+			initString: codeBlock{
+				code: `var client = new grpc.Client();`,
+			},
+			vuString: codeBlock{
+				code: `client.connect("GRPCBIN_ADDR", {reflect: true})`,
+			},
+		},
+		{
+			// Reproduces the bug seen with the Elixir grpc_reflection library
+			// (v0.2.0 / v0.3.0). That library encodes nested enums as separate
+			// synthetic top-level enum files — e.g. "pkg.MsgA.SortOrder.proto"
+			// contains a top-level enum SortOrder, and "pkg.MsgB.SortOrder.proto"
+			// also contains a top-level enum SortOrder, both in the same package.
+			// protodesc.NewFiles() rejects them with:
+			//   proto: file "pkg.MsgB.SortOrder.proto" has a name conflict
+			//   over pkg.SORT_ORDER_UNSPECIFIED
+			// See: https://github.com/grafana/k6/issues/5712
+			name: "ReflectNestedEnumNameConflict_ElixirStyle",
+			setup: func(tb *httpmultibin.HTTPMultiBin) {
+				pkg := "grpc.nested_enum_testing"
+
+				mustMarshal := func(m proto.Message) []byte {
+					b, err := proto.Marshal(m)
+					if err != nil {
+						panic(err)
+					}
+					return b
+				}
+				strPtr := func(s string) *string { return &s }
+				int32Ptr := func(i int32) *int32 { return &i }
+
+				// Elixir grpc_reflection encodes each nested enum as a separate
+				// top-level enum in its own synthetic file, named
+				// "<package>.<ParentMessage>.<EnumName>.proto".
+				foosSortOrderFile := mustMarshal(&descriptorpb.FileDescriptorProto{
+					Name:    strPtr(pkg + ".ListFoosRequest.SortOrder.proto"),
+					Package: strPtr(pkg),
+					Syntax:  strPtr("proto3"),
+					EnumType: []*descriptorpb.EnumDescriptorProto{{
+						Name: strPtr("SortOrder"),
+						Value: []*descriptorpb.EnumValueDescriptorProto{
+							{Name: strPtr("SORT_ORDER_UNSPECIFIED"), Number: int32Ptr(0)},
+							{Name: strPtr("SORT_ORDER_NEWEST_FIRST"), Number: int32Ptr(1)},
+						},
+					}},
+				})
+
+				// Same enum name in same package — this triggers the conflict.
+				barsSortOrderFile := mustMarshal(&descriptorpb.FileDescriptorProto{
+					Name:    strPtr(pkg + ".ListBarsRequest.SortOrder.proto"),
+					Package: strPtr(pkg),
+					Syntax:  strPtr("proto3"),
+					EnumType: []*descriptorpb.EnumDescriptorProto{{
+						Name: strPtr("SortOrder"),
+						Value: []*descriptorpb.EnumValueDescriptorProto{
+							{Name: strPtr("SORT_ORDER_UNSPECIFIED"), Number: int32Ptr(0)},
+							{Name: strPtr("SORT_ORDER_OLDEST_FIRST"), Number: int32Ptr(1)},
+						},
+					}},
+				})
+
+				foosFile := mustMarshal(&descriptorpb.FileDescriptorProto{
+					Name:       strPtr(pkg + ".ListFoosRequest.proto"),
+					Package:    strPtr(pkg),
+					Syntax:     strPtr("proto3"),
+					Dependency: []string{pkg + ".ListFoosRequest.SortOrder.proto"},
+					MessageType: []*descriptorpb.DescriptorProto{
+						{
+							Name: strPtr("ListFoosRequest"),
+							EnumType: []*descriptorpb.EnumDescriptorProto{{
+								Name: strPtr("SortOrder"),
+								Value: []*descriptorpb.EnumValueDescriptorProto{
+									{Name: strPtr("SORT_ORDER_UNSPECIFIED"), Number: int32Ptr(0)},
+									{Name: strPtr("SORT_ORDER_NEWEST_FIRST"), Number: int32Ptr(1)},
+								},
+							}},
+						},
+						{Name: strPtr("ListFoosResponse")},
+					},
+				})
+
+				barsFile := mustMarshal(&descriptorpb.FileDescriptorProto{
+					Name:       strPtr(pkg + ".ListBarsRequest.proto"),
+					Package:    strPtr(pkg),
+					Syntax:     strPtr("proto3"),
+					Dependency: []string{pkg + ".ListBarsRequest.SortOrder.proto"},
+					MessageType: []*descriptorpb.DescriptorProto{
+						{
+							Name: strPtr("ListBarsRequest"),
+							EnumType: []*descriptorpb.EnumDescriptorProto{{
+								Name: strPtr("SortOrder"),
+								Value: []*descriptorpb.EnumValueDescriptorProto{
+									{Name: strPtr("SORT_ORDER_UNSPECIFIED"), Number: int32Ptr(0)},
+									{Name: strPtr("SORT_ORDER_OLDEST_FIRST"), Number: int32Ptr(1)},
+								},
+							}},
+						},
+						{Name: strPtr("ListBarsResponse")},
+					},
+				})
+
+				svcFile := mustMarshal(&descriptorpb.FileDescriptorProto{
+					Name:    strPtr(pkg + ".NestedEnumService.proto"),
+					Package: strPtr(pkg),
+					Syntax:  strPtr("proto3"),
+					Dependency: []string{
+						pkg + ".ListFoosRequest.proto",
+						pkg + ".ListBarsRequest.proto",
+					},
+					Service: []*descriptorpb.ServiceDescriptorProto{{
+						Name: strPtr("NestedEnumService"),
+						Method: []*descriptorpb.MethodDescriptorProto{
+							{
+								Name:       strPtr("ListFoos"),
+								InputType:  strPtr("." + pkg + ".ListFoosRequest"),
+								OutputType: strPtr("." + pkg + ".ListFoosResponse"),
+							},
+							{
+								Name:       strPtr("ListBars"),
+								InputType:  strPtr("." + pkg + ".ListBarsRequest"),
+								OutputType: strPtr("." + pkg + ".ListBarsResponse"),
+							},
+						},
+					}},
+				})
+
+				v1alphagrpc.RegisterServerReflectionServer(
+					tb.ServerGRPC,
+					&elixirStyleReflectionServer{
+						svcName: pkg + ".NestedEnumService",
+						fileBytes: [][]byte{
+							svcFile, foosFile, barsFile,
+							foosSortOrderFile, barsSortOrderFile,
+						},
+					},
+				)
+			},
+			initString: codeBlock{
+				code: `var client = new grpc.Client();`,
+			},
+			vuString: codeBlock{
+				code:  `client.connect("GRPCBIN_ADDR", {reflect: true})`,
+				err:   `name conflict`,
 			},
 		},
 		{
@@ -1689,4 +1850,40 @@ func TestAnyWithNotCommonTypes(t *testing.T) {
 		})
 		`))
 	require.NoError(t, err)
+}
+
+// elixirStyleReflectionServer is a mock grpc reflection v1alpha server that
+// mimics the Elixir grpc_reflection library: it returns all file descriptors
+// in a single response, one synthetic file per message type.
+type elixirStyleReflectionServer struct {
+	v1alphagrpc.UnimplementedServerReflectionServer
+	svcName   string
+	fileBytes [][]byte
+}
+
+func (s *elixirStyleReflectionServer) ServerReflectionInfo(stream v1alphagrpc.ServerReflection_ServerReflectionInfoServer) error {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		switch req.MessageRequest.(type) {
+		case *v1alphagrpc.ServerReflectionRequest_ListServices:
+			_ = stream.Send(&v1alphagrpc.ServerReflectionResponse{
+				MessageResponse: &v1alphagrpc.ServerReflectionResponse_ListServicesResponse{
+					ListServicesResponse: &v1alphagrpc.ListServiceResponse{
+						Service: []*v1alphagrpc.ServiceResponse{{Name: s.svcName}},
+					},
+				},
+			})
+		default:
+			_ = stream.Send(&v1alphagrpc.ServerReflectionResponse{
+				MessageResponse: &v1alphagrpc.ServerReflectionResponse_FileDescriptorResponse{
+					FileDescriptorResponse: &v1alphagrpc.FileDescriptorResponse{
+						FileDescriptorProto: s.fileBytes,
+					},
+				},
+			})
+		}
+	}
 }
